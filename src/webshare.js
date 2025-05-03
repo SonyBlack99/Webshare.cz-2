@@ -692,8 +692,22 @@ const webshare = {
                 return false;
             });
             
+            // Log rejected items to understand filtering
+            console.log(`==== REJECTED ${rejectedItems.length} ITEMS ====`);
+            const topRejected = rejectedItems
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 10); // Show top 10 rejected items by score
+                
+            topRejected.forEach(item => {
+                console.log(`🚫 ${item.name} | Score: ${item.score.toFixed(2)} | ${item.reason}`);
+            });
+            
+            console.log(`Filtered from ${uniqueResults.length} to ${filteredResults.length} results using improved movie filtering`);
+            
             // If we've filtered too aggressively, use a more relaxed approach
             if (filteredResults.length < 10 && uniqueResults.length > 20) {
+                console.log("⚠️ Few results after filtering. Applying relaxed filtering...");
+                
                 // For movies, use a smart fallback approach that mirrors the old addon
                 // but still tries to exclude obvious non-matches
                 const relaxedResults = uniqueResults.filter(item => {
@@ -938,7 +952,127 @@ const webshare = {
                 return restStream
             }
         }))
+    },
+    
+    // Optimalizovaná verzia addUrlToStreams, ktorá používa chunking pre paralelné spracovanie
+    addUrlToStreamsBatch: async (streams, token) => {
+        const startTime = Date.now()
+        console.log(`⏱️ Adding URLs started for ${streams.length} streams (batched)`)
+        
+        // Rozdelenie streamov do skupín po 10 pre paralelné spracovanie
+        const batchSize = 10
+        const batches = []
+        
+        for (let i = 0; i < streams.length; i += batchSize) {
+            batches.push(streams.slice(i, i + batchSize))
+        }
+        
+        console.log(`🔄 Processing in ${batches.length} batches of max ${batchSize} streams`)
+        
+        // Spracujeme každú dávku postupne, ale v rámci dávky paralelne
+        const results = []
+        for (let i = 0; i < batches.length; i++) {
+            const batchStartTime = Date.now()
+            console.log(`⏱️ Processing batch ${i+1}/${batches.length}`)
+            
+            const batchResults = await Promise.all(batches[i].map(async stream => {
+                const { ident, ...restStream } = stream
+                const data = formencode({ ident, download_type: 'video_stream', force_https: 1, wst: token })
+                const resp = await needle('post', 'https://webshare.cz/api/file_link/', data, { headers })
+                const status = resp.body.children.find(el => el.name === 'status').value
+                if (status === 'OK') {
+                    const url = resp.body.children.find(el => el.name === 'link').value
+                    return { ...restStream, url }
+                } else {
+                    return restStream
+                }
+            }))
+            
+            results.push(...batchResults)
+            console.log(`✅ Batch ${i+1} completed in ${Date.now() - batchStartTime}ms`)
+            
+            // Pridáme malé oneskorenie medzi dávkami, aby sme nepreťažili server
+            if (i < batches.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 100))
+            }
+        }
+        
+        console.log(`⏱️ Adding URLs completed in ${Date.now() - startTime}ms (batched mode)`)
+        return results
+    },
+    
+    // Simple performance logging methods
+    logPerformance: (message, startTime = null) => {
+        const now = Date.now()
+        if (startTime) {
+            console.log(`⏱️ ${message} took ${now - startTime}ms`)
+            return now
+        } else {
+            console.log(`⏱️ ${message} at ${now}`)
+            return now
+        }
     }
+}
+
+// Fix NaN issue with module loading time by ensuring addonStartTime is initialized first
+if (!global.addonStartTime) {
+    global.addonStartTime = Date.now()
+    console.log(`⏱️ Addon startup time initialized`)
+}
+
+// Now log the module loading time
+const moduleLoadedTime = Date.now()
+console.log(`⏱️ Webshare module loaded in ${moduleLoadedTime - global.addonStartTime}ms`)
+
+// Store original methods for performance tracking
+const originalLogin = webshare.login
+const originalSearch = webshare.search
+const originalAddUrlToStreams = webshare.addUrlToStreams
+
+// Wrap methods with performance logging
+webshare.login = async () => {
+    console.log(`⏱️ Login started`)
+    const startTime = Date.now()
+    try {
+        const result = await originalLogin()
+        console.log(`⏱️ Login completed in ${Date.now() - startTime}ms`)
+        return result
+    } catch (error) {
+        console.log(`❌ Login failed after ${Date.now() - startTime}ms: ${error.message}`)
+        throw error
+    }
+}
+
+webshare.search = async (showInfo, token) => {
+    console.log(`⏱️ Search started for ${showInfo.type} "${showInfo.name}"`)
+    const startTime = Date.now()
+    try {
+        const result = await originalSearch(showInfo, token)
+        console.log(`⏱️ Search completed in ${Date.now() - startTime}ms, found ${result.length} results`)
+        return result
+    } catch (error) {
+        console.log(`❌ Search failed after ${Date.now() - startTime}ms: ${error.message}`)
+        throw error
+    }
+}
+
+webshare.addUrlToStreams = async (streams, token) => {
+    console.log(`⏱️ Adding URLs started for ${streams.length} streams`)
+    const startTime = Date.now()
+    try {
+        const result = await originalAddUrlToStreams(streams, token)
+        console.log(`⏱️ Adding URLs completed in ${Date.now() - startTime}ms`)
+        return result
+    } catch (error) {
+        console.log(`❌ Adding URLs failed after ${Date.now() - startTime}ms: ${error.message}`)
+        throw error
+    }
+}
+
+// Initialize global start time if not set
+if (!global.addonStartTime) {
+    global.addonStartTime = Date.now()
+    console.log(`⏱️ Addon startup time initialized`)
 }
 
 module.exports = webshare
