@@ -49,28 +49,7 @@ const generateLocalizedVariants = (title) => {
         variants.push(withoutThe);
     }
     
-    // Rule 3: Some English words are transliterated (phonetic translation)
-    // Common patterns for English to Czech/Slovak transliteration
-    const transliterationRules = [
-        { en: 'c', local: 'k' },     // conclave -> konklave
-        { en: 'w', local: 'v' },     // west -> vest
-        { en: 'oo', local: 'u' },    // book -> buk
-        { en: 'qu', local: 'kv' },   // queen -> kven
-        { en: 'th', local: 't' },    // theater -> teater
-        { en: 'y', local: 'i' },     // mystery -> misteri
-        { en: 'x', local: 'ks' },    // box -> boks
-    ];
-    
-    // Generate transliterated variants
-    let transliterated = cleanTitle;
-    transliterationRules.forEach(rule => {
-        if (transliterated.includes(rule.en)) {
-            transliterated = transliterated.replace(new RegExp(rule.en, 'g'), rule.local);
-            variants.push(transliterated);
-        }
-    });
-    
-    // Rule 4: Sometimes English name becomes totally different in Czech/Slovak
+    // Rule 3: Sometimes English name becomes totally different in Czech/Slovak
     // We can't hardcode these, but we can look for TV shows/movies with different regional titles
     // in the metadata if available (handled elsewhere)
     
@@ -78,16 +57,24 @@ const generateLocalizedVariants = (title) => {
 }
 
 const getQueries = (info) => {
-    const name = info.originalName || info.name
-    const names = [name]
+    // Use original name if available, otherwise use the localized name
+    const originalName = info.originalName || info.name
+    
+    // Start with both original and localized names as search base
+    const names = [originalName]
+    
+    // IMPORTANT: Always add localized name if available and different
+    if (info.name && info.originalName && info.name !== info.originalName) {
+        names.push(info.name)
+    }
     
     // Add alternative language titles if available from metadata
     if (info.altTitles && Array.isArray(info.altTitles)) {
         names.push(...info.altTitles)
     }
     
-    // Generate potential localized variants
-    const localizedVariants = generateLocalizedVariants(name);
+    // Generate potential localized variants (just removing "The" now)
+    const localizedVariants = generateLocalizedVariants(originalName);
     names.push(...localizedVariants);
     
     // Also try with language tags
@@ -95,7 +82,17 @@ const getQueries = (info) => {
 
     if (info.type === 'series') {
         const episodeTags = generateEpisodeTags(info.series, info.episode)
-        return names.flatMap(name => episodeTags.map(tag => `${name} ${tag}`))
+        
+        // For series with year available, add year-specific queries 
+        if (info.year) {
+            // Add year to some queries for popular shows that have remakes (like The Office US/UK)
+            return [
+                ...names.flatMap(name => episodeTags.map(tag => `${name} ${tag}`)),
+                ...names.flatMap(name => [`${name} ${info.year} ${episodeTags[0]}`, `${name} (${info.year}) ${episodeTags[0]}`])
+            ]
+        } else {
+            return names.flatMap(name => episodeTags.map(tag => `${name} ${tag}`))
+        }
     } else {
         // For movies, generate more query variants to find matches
         return names.flatMap(name => {
@@ -119,6 +116,8 @@ const getQueries = (info) => {
                 base.forEach(variant => {
                     if (!variant.includes(info.year)) {
                         base.push(`${variant} ${info.year}`)
+                        // Also add version with parentheses
+                        base.push(`${variant} (${info.year})`)
                     }
                 })
             }
@@ -129,15 +128,12 @@ const getQueries = (info) => {
 }
 
 const search = async (query, token, info) => {
-    console.log('🔍 Searching for:', query)
     const data = formencode({ what: query, category: 'video', limit: 100, wst: token })
     const resp = await needle('post', 'https://webshare.cz/api/search/', data, { headers })
     const files = resp.body.children.filter(el => el.name === 'file')
 
     const queryClean = clean(query)
     const queryWords = queryClean.split(' ').filter(w => w.length > 1)
-    console.log('📋 Cleaned query:', queryClean)
-    console.log('📚 Query words:', queryWords)
 
     // Extract main title and year for movie matching
     let mainTitle = info.name
@@ -203,13 +199,91 @@ const search = async (query, token, info) => {
         const simpleName = clean(item.name)
         let matchScore = 0
 
-        const looksLikeDate = /\b(19|20)\d{2}\b/.test(item.name) || /\b\d{1,2}[.\-_ ]\d{1,2}[.\-_ ]\d{2,4}\b/.test(item.name)
-        
-        // Improve title matching to recognize alternative titles
+        // For both movies and series, give a significant boost when title is at the beginning
+        // Check early to affect all matches
         const possibleTitles = [clean(info.name)]
         if (info.originalName) possibleTitles.push(clean(info.originalName))
         
+        // Find if any of the possible titles appear at the beginning
+        const titleAtStart = possibleTitles.some(title => {
+            const pos = simpleName.indexOf(title);
+            // Consider it at the start if it's the first word or has only a short prefix
+            return pos === 0 || pos <= 3;
+        });
+        
+        // Significant boost for title at beginning
+        if (titleAtStart) {
+            matchScore += 0.6; // Much larger boost
+        }
+
+        // Boost scores for localized content - simple version
+        if (/\b(?:CZ|SK)\b.*(?:dab|dabing)/i.test(item.name) || 
+            /(?:dab|dabing).*\b(?:CZ|SK)\b/i.test(item.name)) {
+            // Big boost for CZ/SK dubbing
+            matchScore += 0.4;
+        } else if (/\b(?:CZ|SK)\b/i.test(item.name)) {
+            // Medium boost for just CZ/SK tag
+            matchScore += 0.3;
+        } else if (/(?:tit(?:ulky)?|sub(?:s)?)/i.test(item.name)) {
+            // Smaller boost for subtitles
+            matchScore += 0.2;
+        }
+
+        const looksLikeDate = /\b(19|20)\d{2}\b/.test(item.name) || /\b\d{1,2}[.\-_ ]\d{1,2}[.\-_ ]\d{2,4}\b/.test(item.name)
+        
+        // Fix - don't redefine possibleTitles
         const titleInName = possibleTitles.some(title => simpleName.includes(title))
+
+        // Check for series if episode tag directly follows title (no words in between)
+        let episodeTagFollowsTitle = false;
+        if (info.type === 'series') {
+            const episodeTags = generateEpisodeTags(info.series, info.episode).map(clean);
+            
+            // Find which title variant matched
+            const matchedTitle = possibleTitles.find(title => simpleName.includes(title));
+            
+            // Check if the episode tag follows immediately after the title
+            if (matchedTitle) {
+                const titleEnd = simpleName.indexOf(matchedTitle) + matchedTitle.length;
+                const afterTitle = simpleName.substring(titleEnd).trim();
+                
+                // Check if any episode tag is at the beginning of the text after the title
+                episodeTagFollowsTitle = episodeTags.some(tag => {
+                    const tagClean = clean(tag);
+                    return afterTitle.startsWith(tagClean) || 
+                           afterTitle.substring(0, 3).includes(tagClean);
+                });
+                
+                if (episodeTagFollowsTitle) {
+                    // Add big boost when episode tag directly follows the title
+                    matchScore += 0.8;
+                }
+            }
+        }
+        
+        // Store this important property for sorting later
+        item.episodeTagFollowsTitle = episodeTagFollowsTitle;
+        
+        // For titles not at the beginning, reduce relevance significantly 
+        // to prevent random matches elsewhere in filename
+        if (!titleAtStart && titleInName) {
+            // Find the position of the title in the filename
+            const matchedTitle = possibleTitles.find(title => simpleName.includes(title));
+            if (matchedTitle) {
+                const titlePos = simpleName.indexOf(matchedTitle);
+                const titleLen = matchedTitle.length;
+                
+                // Calculate what percentage into the filename the title appears
+                const relativePosition = titlePos / simpleName.length;
+                
+                // Title in middle or end reduces score significantly
+                if (relativePosition > 0.4) {
+                    // The later the title appears, the more we reduce the score
+                    const reduction = 0.5 + (relativePosition * 0.5); // 50-75% reduction
+                    matchScore *= (1 - reduction);
+                }
+            }
+        }
 
         // For movies, be more lenient with matching
         if (info.type === 'movie') {
@@ -311,7 +385,27 @@ const search = async (query, token, info) => {
             }
         }
 
-        return { ...item, match: matchScore, simpleName }
+        // IMPORTANT: If the title is not at the beginning, reduce relevance significantly
+        // to prevent random matches elsewhere in filename
+        if (!titleAtStart && info.type === 'series') {
+            // Determine how far into the file the title appears
+            const titlePos = possibleTitles.reduce((best, title) => {
+                const pos = simpleName.indexOf(title);
+                return pos >= 0 && (best === -1 || pos < best) ? pos : best;
+            }, -1);
+            
+            // If title is in middle or end, drastically reduce score
+            if (titlePos > simpleName.length / 3) {
+                matchScore *= 0.3; // Reduce by 70%
+            }
+        }
+
+        return { 
+            ...item, 
+            match: matchScore, 
+            simpleName,
+            titleAtStart // Store this for sorting
+        }
     })
     .filter(item => item && item.match > 0)
 }
@@ -320,7 +414,6 @@ const webshare = {
     login: async () => {
         const user = process.env.WEBSHARE_LOGIN
         const password = process.env.WEBSHARE_PASSWORD
-        console.log(`🔑 Logging in user ${user}`)
         const saltResp = await needle('post', 'https://webshare.cz/api/salt/', `username_or_email=${user}`, { headers })
         const salt = saltResp.body.children.find(el => el.name === 'salt').value
 
@@ -339,11 +432,23 @@ const webshare = {
         results = results.flatMap(items => items)
 
         const isPreferredDabing = (name) => {
-            const dabingPatterns = [/\bSK\b/i, /\bCZ\b/i, /\bdabing\b/i, /\bSKdab\b/i, /\bCZdab\b/i]
-            const titulkyPatterns = [/CZ ?tit(ulky)?/i, /SK ?tit(ulky)?/i, /\btitulky\b/i, /\bsubs\b/i]
+            // Enhanced pattern matching for different audio localizations
+            const dabingPatterns = [
+                /\b(?:CZ|SK)\b.*(?:dab|dabing)/i,  // CZ/SK dabing
+                /(?:dab|dabing).*\b(?:CZ|SK)\b/i,   // dabing CZ/SK
+                /\b(?:CZ|SK)dab\b/i,                // CZdab/SKdab
+                /\b(?:CZ|SK)\b/i                    // Just CZ/SK tag
+            ]
+            const titulkyPatterns = [
+                /(?:CZ|SK) ?tit(?:ulky)?/i, 
+                /tit(?:ulky)? ?(?:CZ|SK)/i,
+                /\btit(?:ulky)?\b/i, 
+                /\bsub(?:titles|s)?\b/i
+            ]
 
-            if (dabingPatterns.some(p => p.test(name))) return 2
-            if (titulkyPatterns.some(p => p.test(name))) return 1
+            // Increased values to make the preference stronger
+            if (dabingPatterns.some(p => p.test(name))) return 3
+            if (titulkyPatterns.some(p => p.test(name))) return 2
             return 0
         }
 
@@ -366,101 +471,125 @@ const webshare = {
             const possibleTitles = [clean(showInfo.name)]
             if (showInfo.originalName) possibleTitles.push(clean(showInfo.originalName))
             
-            // Print debug info for series title matching
-            console.log('🔍 Looking for series with possible titles:', possibleTitles.join(', '))
-            
             uniqueResults.forEach(item => {
                 // Series relevance score starts at 0
                 let seriesRelevance = 0
                 
-                // Episode tag match is MOST important (up to 10 points)
+                // If title appears at beginning, big relevance boost
+                if (item.titleAtStart) {
+                    seriesRelevance += 8; // Very significant boost
+                }
+                
+                // Episode tag match is MOST important
                 if (episodeTags.some(tag => item.simpleName.includes(tag))) {
                     seriesRelevance += 10
                     
-                    // Check for ANY title match, not just the first title
+                    // Check for ANY title match
                     const matchedTitle = possibleTitles.find(title => item.simpleName.includes(title))
                     if (matchedTitle) {
-                        // If it also has any of the series titles, it's very likely relevant
                         seriesRelevance += 5
                         
-                        // For debugging - show which title matched
-                        console.log(`🎯 Found match for "${matchedTitle}" in "${item.name}"`)
+                        // Check if episode tag comes directly after title
+                        const titleEnd = item.simpleName.indexOf(matchedTitle) + matchedTitle.length;
+                        const afterTitle = item.simpleName.substring(titleEnd).trim();
+                        
+                        // Check if any episode tag is at the beginning of the text after the title
+                        const episodeTagFollowsTitle = episodeTags.some(tag => {
+                            const tagClean = clean(tag);
+                            return afterTitle.startsWith(tagClean) || 
+                                  afterTitle.substring(0, 3).includes(tagClean);
+                        });
+                        
+                        if (episodeTagFollowsTitle) {
+                            // Direct title+episode pattern gets maximum points
+                            seriesRelevance += 7;
+                        }
+                        
+                        // Store this for sorting
+                        item.episodeTagFollowsTitle = episodeTagFollowsTitle;
+                    } else {
+                        // Make sure to initialize the property even when no title match is found
+                        item.episodeTagFollowsTitle = false;
                     }
+                } else {
+                    // No episode tag match
+                    item.episodeTagFollowsTitle = false;
                 }
                 
-                // Store this score for sorting
-                item.seriesRelevance = seriesRelevance
+                // Always ensure episodeTagFollowsTitle is defined
+                if (item.episodeTagFollowsTitle === undefined) {
+                    item.episodeTagFollowsTitle = false;
+                }
+                
+                item.seriesRelevance = seriesRelevance;
                 
                 // Also store which title variant matched for better sorting
-                item.matchedTitle = possibleTitles.find(title => item.simpleName.includes(title)) || ''
+                item.matchedTitle = possibleTitles.find(title => item.simpleName.includes(title)) || '';
+                
+                // NEW: Store title position information for sorting
+                if (item.matchedTitle) {
+                    item.titlePosition = item.simpleName.indexOf(item.matchedTitle);
+                    item.titleAtStart = item.titlePosition <= 3;
+                } else {
+                    item.titlePosition = -1;
+                    item.titleAtStart = false;
+                }
                 
                 // Critical: Mark the filename language for filtering - without using specific titles
-                // Check for localized version indicators in the filename
-                const localizedPattern = /(?:\b(?:CZ|SK)\b|dabing|dab|titulky|tit\b)/i;
-                // Original version indicators (typically English)
-                const originalPattern = /(?:\b(?:EN|ENG)\b|\bUS\b|HDTV|\bx264|\bh26[45]|webrip|720p|1080p|2160p|bluray)/i;
+                // Improved localized version detection - more accurate for Czech/Slovak content
+                const localizedPattern = /(?:\b(?:CZ|SK|SK\.|\[SK\]|\[CZ\])\b|dabing|\bDAB\b|titulky|tit\b|CZ\.|SK\.)/i;
                 
-                if (localizedPattern.test(item.name)) {
-                    item.isLocalizedVersion = true;
-                } else if (originalPattern.test(item.name)) {
-                    item.isLocalizedVersion = false;
-                } else {
-                    // If no clear indicators, default to assuming it's original based on series relevance
-                    item.isLocalizedVersion = false;
-                }
+                // Make sure we don't miss any localized versions
+                const hasCzSkDubbing = /\b(?:CZ|SK)\b.*(?:dab|dabing)/i.test(item.name) || 
+                                      /(?:dab|dabing).*\b(?:CZ|SK)\b/i.test(item.name);
+                const hasCzSk = /\b(?:CZ|SK)\b|CZ\.|SK\./i.test(item.name);
+                const hasSubtitles = /(?:CZ|SK)?\s*(?:tit(?:ulky)?|sub(?:s)?)/i.test(item.name);
+                
+                // Store detailed info about localization for better sorting later
+                item.hasCzSkDubbing = hasCzSkDubbing;
+                item.hasCzSk = hasCzSk;
+                item.hasSubtitles = hasSubtitles;
+                
+                // Determine if it's a localized version
+                item.isLocalizedVersion = hasCzSkDubbing || hasCzSk || hasSubtitles || localizedPattern.test(item.name);
             })
         }
 
         uniqueResults.sort((a, b) => {
-            // For series, use our specialized relevance score as the highest priority
+            // For series, prioritize based on our detailed scoring
             if (showInfo.type === 'series') {
-                // First sort by episode relevance
+                // First prioritize exact pattern: title directly followed by episode tag
+                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
+                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
+                
+                // Then prioritize title at beginning
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
+                
+                // Then by series relevance score
                 if (a.seriesRelevance !== b.seriesRelevance) {
-                    return b.seriesRelevance - a.seriesRelevance
-                }
-                
-                // If episode relevance is the same and both have the requested title
-                // (either original or translation), preserve the order they were found in
-                const requestedTitle = clean(showInfo.name);
-                if (a.seriesRelevance > 0 && b.seriesRelevance > 0) {
-                    const aHasRequestedTitle = a.simpleName.includes(requestedTitle);
-                    const bHasRequestedTitle = b.simpleName.includes(requestedTitle);
-                    
-                    // Prioritize exact title matches for the requested title
-                    if (aHasRequestedTitle && !bHasRequestedTitle) return -1;
-                    if (!aHasRequestedTitle && bHasRequestedTitle) return 1;
+                    return b.seriesRelevance - a.seriesRelevance;
                 }
             }
             
-            // For movies, prioritize exact title matches first
+            // For movies, also consider title position
             if (showInfo.type === 'movie') {
-                const exactTitleA = a.simpleName.startsWith(clean(showInfo.name))
-                const exactTitleB = b.simpleName.startsWith(clean(showInfo.name))
+                // Prioritize title at start for movies too
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
                 
-                // Check for year match if available
-                const yearA = showInfo.year && a.simpleName.includes(showInfo.year)
-                const yearB = showInfo.year && b.simpleName.includes(showInfo.year)
-                
-                // Prioritize both title and year match
-                if ((exactTitleA && yearA) && !(exactTitleB && yearB)) return -1
-                if (!(exactTitleA && yearA) && (exactTitleB && yearB)) return 1
-                
-                // Then just title match
-                if (exactTitleA && !exactTitleB) return -1
-                if (!exactTitleA && exactTitleB) return 1
+                // ...existing movie sorting criteria...
             }
             
-            // For series, prioritize exact episode matches first
+            // For series, more strongly penalize results where the title is not at the beginning
             if (showInfo.type === 'series') {
-                const episodeTags = generateEpisodeTags(showInfo.series, showInfo.episode).map(clean)
+                // If one has title at beginning and one doesn't, this is the most important factor
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
                 
-                // Check if both have exact episode tags
-                const aHasExactTag = episodeTags.some(tag => a.simpleName.includes(tag))
-                const bHasExactTag = episodeTags.some(tag => b.simpleName.includes(tag))
-                
-                // If only one has the exact tag, prioritize it
-                if (aHasExactTag && !bHasExactTag) return -1
-                if (!aHasExactTag && bHasExactTag) return 1
+                // If both have title at beginning or not, then check episode tag follows title
+                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
+                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
             }
             
             // Next check for dubbing preferences
@@ -474,14 +603,6 @@ const webshare = {
 
             // If match scores are equal, sort by size (bigger first)
             return b.size - a.size
-        })
-
-        // Add debug information to see how matching works
-        console.log("SORTED RESULTS PREVIEW:")
-        uniqueResults.slice(0, 10).forEach((item, i) => {
-            console.log(`${i+1}. ${item.name} | Score: ${item.match}${
-                showInfo.type === 'series' ? ` | Series Relevance: ${item.seriesRelevance}` : ''
-            } | Size: ${item.size}`)
         })
 
         // Filter results more intelligently
@@ -507,19 +628,13 @@ const webshare = {
             const titleWords = clean(showInfo.name).split(' ')
                 .filter(w => w.length > 2 && !['the', 'and', 'for', 'with', 'from'].includes(w))
             
-            console.log(`Movie title variants: ${movieTitleVariants.join(', ')}`);
-            console.log(`Title keywords: ${titleWords.join(', ')}`);
-            console.log(`Movie year: ${movieYear}`);
-            
             // Debug array to track rejected items and why they were filtered
             const rejectedItems = [];
             
-            // For titles with queries containing "CZ" or "SK", be more lenient (like in "Conclave CZ" search)
+            // For titles with queries containing "CZ" or "SK", also be lenient (like in "Conclave CZ" search)
             // This helps find localized versions
             const queriesHadLanguageTag = queries.some(q => 
                 /\b(?:cz|sk)\b/i.test(q) || q.toLowerCase().includes('dabing'));
-            
-            console.log(`Search queries included language tags: ${queriesHadLanguageTag}`);
                 
             // First try smarter filtering - but be smarter about query patterns
             filteredResults = uniqueResults.filter(item => {
@@ -634,21 +749,70 @@ const webshare = {
         filteredResults.sort((a, b) => {
             // For movies, prioritize exact title matches first
             if (showInfo.type === 'movie') {
-                // Exact title pattern
-                const exactTitleA = a.simpleName.startsWith(clean(showInfo.name))
-                const exactTitleB = b.simpleName.startsWith(clean(showInfo.name))
+                // Check for exact match with either original or localized title
+                const titleMatchA = showInfo.originalName && a.simpleName.includes(clean(showInfo.originalName)) || 
+                                       a.simpleName.includes(clean(showInfo.name))
+                const titleMatchB = showInfo.originalName && b.simpleName.includes(clean(showInfo.originalName)) || 
+                                       b.simpleName.includes(clean(showInfo.name))
+                
+                // NEW: Check if title appears at start
+                const titleAtStartA = titleMatchA && a.simpleName.indexOf(clean(showInfo.name)) <= 3;
+                const titleAtStartB = titleMatchB && b.simpleName.indexOf(clean(showInfo.name)) <= 3;
+                
+                // Prioritize title at start
+                if (titleAtStartA && !titleAtStartB) return -1;
+                if (!titleAtStartA && titleAtStartB) return 1;
                 
                 // Year match
-                const yearA = showInfo.year && a.simpleName.includes(showInfo.year)
-                const yearB = showInfo.year && b.simpleName.includes(showInfo.year)
+                const yearA = showInfo.year && a.simpleName.includes(showInfo.year);
+                const yearB = showInfo.year && b.simpleName.includes(showInfo.year);
                 
-                // Title and year is best case
-                if ((exactTitleA && yearA) && !(exactTitleB && yearB)) return -1
-                if (!(exactTitleA && yearA) && (exactTitleB && yearB)) return 1
+                // Title and year is best case - give this highest priority
+                if ((titleMatchA && yearA) && !(titleMatchB && yearB)) return -1
+                if (!(titleMatchA && yearA) && (titleMatchB && yearB)) return 1
+                
+                // Detect sequels/numbered entries to help sort Die Hard 1 vs Die Hard 2
+                const hasSequelNumberA = /\b(part|diel|cast)?\s*[2-9](\b|$)/i.test(a.simpleName) || 
+                                       /\b(II|III|IV|V|VI|VII|VIII|IX)\b/.test(a.simpleName);
+                const hasSequelNumberB = /\b(part|diel|cast)?\s*[2-9](\b|$)/i.test(b.simpleName) || 
+                                       /\b(II|III|IV|V|VI|VII|VIII|IX)\b/.test(b.simpleName);
+                
+                // If we have the year and one is a sequel but the other isn't, prioritize non-sequel
+                if (showInfo.year) {
+                    if (!hasSequelNumberA && hasSequelNumberB) return -1
+                    if (hasSequelNumberA && !hasSequelNumberB) return 1
+                }
                 
                 // Just title is second best
-                if (exactTitleA && !exactTitleB) return -1
-                if (!exactTitleA && exactTitleB) return 1
+                if (titleMatchA && !titleMatchB) return -1
+                if (!titleMatchA && titleMatchB) return 1
+            }
+            
+            // For series, prioritize based on our detailed scoring
+            if (showInfo.type === 'series') {
+                // First prioritize exact pattern: title directly followed by episode tag
+                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
+                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
+                
+                // Then prioritize title at beginning
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
+                
+                // Then by series relevance score
+                if (a.seriesRelevance !== b.seriesRelevance) {
+                    return b.seriesRelevance - a.seriesRelevance;
+                }
+            }
+            
+            // For series, more strongly penalize results where the title is not at the beginning
+            if (showInfo.type === 'series') {
+                // If one has title at beginning and one doesn't, this is the most important factor
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
+                
+                // If both have title at beginning or not, then check episode tag follows title
+                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
+                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
             }
             
             // Next check for dubbing preferences
@@ -677,8 +841,6 @@ const webshare = {
                 const hasLocalizedVersions = highRelevanceItems.some(item => item.isLocalizedVersion);
                 const hasOriginalVersions = highRelevanceItems.some(item => !item.isLocalizedVersion);
                 
-                console.log(`Series has localized versions: ${hasLocalizedVersions}, original versions: ${hasOriginalVersions}`);
-                
                 // If we have both types, make sure we include at least one of each type
                 if (hasLocalizedVersions && hasOriginalVersions) {
                     // Get the best localized and original versions
@@ -687,40 +849,85 @@ const webshare = {
                     
                     // Sort by match score and size
                     const bestLocalizedItem = localizedItems.length > 0 ? 
-                        localizedItems.sort((a, b) => b.match - a.match || b.size - a.size)[0] : null;
+                        localizedItems.sort((a, b) => {
+                            // Prioritize title at the beginning
+                            if (a.titleAtStart && !b.titleAtStart) return -1;
+                            if (!a.titleAtStart && b.titleAtStart) return 1;
+                            
+                            // First prioritize CZ/SK dubbing
+                            if (a.hasCzSkDubbing && !b.hasCzSkDubbing) return -1;
+                            if (!a.hasCzSkDubbing && b.hasCzSkDubbing) return 1;
+                            
+                            // Then CZ/SK tag
+                            if (a.hasCzSk && !b.hasCzSk) return -1;
+                            if (!a.hasCzSk && b.hasCzSk) return 1;
+                            
+                            // Then by match score and size
+                            return b.match - a.match || b.size - a.size;
+                        })[0] : null;
                     
                     const bestOriginalItem = originalItems.length > 0 ? 
-                        originalItems.sort((a, b) => b.match - a.match || b.size - a.size)[0] : null;
-                    
-                    console.log("Best localized:", bestLocalizedItem?.name);
-                    console.log("Best original:", bestOriginalItem?.name);
+                        originalItems.sort((a, b) => {
+                            // Prioritize title at the beginning
+                            if (a.titleAtStart && !b.titleAtStart) return -1;
+                            if (!a.titleAtStart && b.titleAtStart) return 1;
+                            
+                            return b.match - a.match || b.size - a.size;
+                        })[0] : null;
                     
                     // Create a new array with both versions at the top
                     const forcedItems = [];
                     
-                    // Add localized version
+                    // Add localized version as FIRST item
                     if (bestLocalizedItem) {
                         forcedItems.push(bestLocalizedItem);
                     }
                     
-                    // Add original version
+                    // Add original version as SECOND item
                     if (bestOriginalItem && bestLocalizedItem?.name !== bestOriginalItem?.name) {
                         forcedItems.push(bestOriginalItem);
-                        console.log("Including both localized and original versions in results");
                     }
                     
                     // Only include other results that aren't these two
                     const otherResults = filteredResults.filter(item => 
                         item.name !== bestLocalizedItem?.name && 
                         item.name !== bestOriginalItem?.name);
-                    
-                    filteredResults = [...forcedItems, ...otherResults];
-                    
-                    // Force log the first few results after our intervention
-                    console.log("FINAL RESULTS ORDER (first 5):");
-                    filteredResults.slice(0, 5).forEach((item, i) => {
-                        console.log(`${i+1}: ${item.name}`);
+                        
+                    // Sort the remaining results with CZ/SK prioritization
+                    otherResults.sort((a, b) => {
+                        // First prioritize localized versions
+                        if (a.isLocalizedVersion && !b.isLocalizedVersion) return -1;
+                        if (!a.isLocalizedVersion && b.isLocalizedVersion) return 1;
+                        
+                        // For localized versions, prioritize dubbing then subtitles
+                        if (a.isLocalizedVersion && b.isLocalizedVersion) {
+                            if (a.hasCzSkDubbing && !b.hasCzSkDubbing) return -1;
+                            if (!a.hasCzSkDubbing && b.hasCzSkDubbing) return 1;
+                        }
+                        
+                        // Original sorting by match and size
+                        return b.match - a.match || b.size - a.size;
                     });
+                    
+                    // Now merge the forced items with others
+                    filteredResults = [...forcedItems, ...otherResults];
+                } else if (hasLocalizedVersions) {
+                    // If we only have localized versions, prioritize them at the top
+                    const localizedItems = highRelevanceItems.filter(item => item.isLocalizedVersion);
+                    
+                    // Sort by localized quality
+                    localizedItems.sort((a, b) => {
+                        if (a.hasCzSkDubbing && !b.hasCzSkDubbing) return -1;
+                        if (!a.hasCzSkDubbing && b.hasCzSkDubbing) return 1;
+                        return b.match - a.match || b.size - a.size;
+                    });
+                    
+                    // Put the best localized items at the top
+                    const bestLocalizedItems = localizedItems.slice(0, 2);
+                    const otherResults = filteredResults.filter(item => 
+                        !bestLocalizedItems.some(best => best.name === item.name));
+                    
+                    filteredResults = [...bestLocalizedItems, ...otherResults];
                 }
             }
         }
