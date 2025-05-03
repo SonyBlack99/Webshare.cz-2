@@ -1,0 +1,3 @@
+module.exports = {
+    tmdbApiKey: 'TMDB API KEY'
+}
