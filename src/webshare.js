@@ -5,11 +5,9 @@ const formencode = require('form-urlencoded')
 const { filesize } = require('filesize')
 require('dotenv').config()
 
-// Updated headers with consistent user-agent to ensure platform-independent results
 const headers = {
     content_type: 'application/x-www-form-urlencoded; charset=UTF-8',
-    accept: 'text/xml; charset=UTF-8',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    accept: 'text/xml; charset=UTF-8'
 }
 
 const clean = str => str
@@ -130,23 +128,8 @@ const getQueries = (info) => {
 }
 
 const search = async (query, token, info) => {
-    // Log search query to help debug differences between platforms
-    console.log(`🔍 Searching for: "${query}" - Type: ${info.type} - Client: ${info.clientInfo || 'unknown'}`);
-    
     const data = formencode({ what: query, category: 'video', limit: 100, wst: token })
-    const resp = await needle('post', 'https://webshare.cz/api/search/', data, { 
-        headers,
-        // Add more consistent behavior for network timeouts across platforms
-        follow_max: 5,
-        follow_set_cookie: true,
-        decode_response: true,
-        parse_response: true,
-        timeout: 10000 // 10 second timeout for all requests
-    })
-    
-    // Log API response status to debug any differences
-    console.log(`API response status: ${resp.statusCode} - Results: ${resp.body?.children?.filter(el => el.name === 'file').length || 0}`);
-    
+    const resp = await needle('post', 'https://webshare.cz/api/search/', data, { headers })
     const files = resp.body.children.filter(el => el.name === 'file')
 
     const queryClean = clean(query)
@@ -431,71 +414,23 @@ const webshare = {
     login: async () => {
         const user = process.env.WEBSHARE_LOGIN
         const password = process.env.WEBSHARE_PASSWORD
-        
-        console.log('🔑 Attempting login to Webshare.cz');
-        
-        const saltResp = await needle('post', 'https://webshare.cz/api/salt/', `username_or_email=${user}`, { 
-            headers,
-            timeout: 10000
-        })
+        const saltResp = await needle('post', 'https://webshare.cz/api/salt/', `username_or_email=${user}`, { headers })
         const salt = saltResp.body.children.find(el => el.name === 'salt').value
 
         const passEncoded = sha1(md5.crypt(password, salt))
         const data = formencode({ username_or_email: user, password: passEncoded, keep_logged_in: 0 })
-        const resp = await needle('post', 'https://webshare.cz/api/login/', data, { 
-            headers,
-            timeout: 10000 
-        })
+        const resp = await needle('post', 'https://webshare.cz/api/login/', data, { headers })
         if (resp.statusCode !== 200 || resp.body.children.find(el => el.name === 'status').value !== 'OK') {
             throw Error('Cannot log in to Webshare.cz, invalid login credentials')
         }
-        
-        console.log('✅ Successfully logged in to Webshare.cz');
-        
         return resp.body.children.find(el => el.name === 'token').value
     },
 
     search: async (showInfo, token) => {
-        // Store client information if provided to help debug platform differences
-        if (showInfo.clientInfo === undefined) {
-            // Extract client info from request headers if available
-            showInfo.clientInfo = 'unknown';
-            try {
-                if (global.stremioReq && global.stremioReq.headers) {
-                    const ua = global.stremioReq.headers['user-agent'] || '';
-                    if (ua.includes('Android') || ua.includes('TV')) {
-                        showInfo.clientInfo = 'android-tv';
-                    } else if (ua.includes('Mobile')) {
-                        showInfo.clientInfo = 'mobile';
-                    } else {
-                        showInfo.clientInfo = 'desktop';
-                    }
-                }
-            } catch (e) {
-                console.error('Error extracting client info:', e.message);
-            }
-        }
-        
-        console.log(`🎬 Searching for ${showInfo.type}: "${showInfo.name}" - Client: ${showInfo.clientInfo}`);
-        
         const queries = getQueries(showInfo)
-        console.log(`Generated ${queries.length} search queries`);
-        
-        // Ensure consistent behavior by limiting parallel requests which might cause rate limiting on different platforms
-        const chunkSize = 5; // Process 5 queries at a time to avoid overwhelming the API
-        let results = [];
-        
-        // Process queries in chunks to avoid rate limiting
-        for (let i = 0; i < queries.length; i += chunkSize) {
-            const chunk = queries.slice(i, i + chunkSize);
-            const chunkResults = await Promise.all(chunk.map(query => search(query, token, showInfo)));
-            results = [...results, ...chunkResults.flat()];
-            // Small delay between chunks to avoid API rate limits that might affect different platforms differently
-            if (i + chunkSize < queries.length) {
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
-        }
-        
+        let results = await Promise.all(queries.map(query => search(query, token, showInfo)))
+        results = results.flatMap(items => items)
+
         const isPreferredDabing = (name) => {
             // Enhanced pattern matching for different audio localizations
             const dabingPatterns = [
@@ -620,54 +555,93 @@ const webshare = {
             })
         }
 
+        // Make sorting more deterministic - simpler comparisons are more reliable across platforms
         uniqueResults.sort((a, b) => {
-            // For series, prioritize based on our detailed scoring
-            if (showInfo.type === 'series') {
-                // First prioritize exact pattern: title directly followed by episode tag
-                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
-                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
-                
-                // Then prioritize title at beginning
-                if (a.titleAtStart && !b.titleAtStart) return -1;
-                if (!a.titleAtStart && b.titleAtStart) return 1;
-                
-                // Then by series relevance score
-                if (a.seriesRelevance !== b.seriesRelevance) {
-                    return b.seriesRelevance - a.seriesRelevance;
+            try {
+                // For series, create a simple numerical priority score for sorting
+                // This approach is more reliable across different JavaScript engines
+                if (showInfo.type === 'series') {
+                    // Convert boolean properties to explicit numbers for consistency
+                    const aTagFollowsTitle = a.episodeTagFollowsTitle ? 1 : 0;
+                    const bTagFollowsTitle = b.episodeTagFollowsTitle ? 1 : 0;
+                    
+                    // If one has tag following title and the other doesn't, prioritize that
+                    if (aTagFollowsTitle !== bTagFollowsTitle) {
+                        return bTagFollowsTitle - aTagFollowsTitle;
+                    }
+                    
+                    // Convert title at start to explicit numbers
+                    const aTitleStart = a.titleAtStart ? 1 : 0;
+                    const bTitleStart = b.titleAtStart ? 1 : 0;
+                    
+                    // If one has title at start and the other doesn't, prioritize that
+                    if (aTitleStart !== bTitleStart) {
+                        return bTitleStart - aTitleStart;
+                    }
+                    
+                    // Use explicit number conversion for series relevance comparison
+                    const aRelevance = Number(a.seriesRelevance || 0);
+                    const bRelevance = Number(b.seriesRelevance || 0);
+                    
+                    if (aRelevance !== bRelevance) {
+                        return bRelevance - aRelevance;
+                    }
                 }
-            }
-            
-            // For movies, also consider title position
-            if (showInfo.type === 'movie') {
-                // Prioritize title at start for movies too
-                if (a.titleAtStart && !b.titleAtStart) return -1;
-                if (!a.titleAtStart && b.titleAtStart) return 1;
                 
-                // ...existing movie sorting criteria...
-            }
-            
-            // For series, more strongly penalize results where the title is not at the beginning
-            if (showInfo.type === 'series') {
-                // If one has title at beginning and one doesn't, this is the most important factor
-                if (a.titleAtStart && !b.titleAtStart) return -1;
-                if (!a.titleAtStart && b.titleAtStart) return 1;
+                // For movies, same approach - convert to explicit numbers
+                if (showInfo.type === 'movie') {
+                    const aTitleStart = a.titleAtStart ? 1 : 0;
+                    const bTitleStart = b.titleAtStart ? 1 : 0;
+                    
+                    if (aTitleStart !== bTitleStart) {
+                        return bTitleStart - aTitleStart;
+                    }
+                }
                 
-                // If both have title at beginning or not, then check episode tag follows title
-                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
-                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
+                // Series title at beginning check - again using explicit numbers
+                if (showInfo.type === 'series') {
+                    const aTitleStart = a.titleAtStart ? 1 : 0;
+                    const bTitleStart = b.titleAtStart ? 1 : 0;
+                    
+                    if (aTitleStart !== bTitleStart) {
+                        return bTitleStart - aTitleStart;
+                    }
+                    
+                    // Episode tag follows title check
+                    const aTagFollowsTitle = a.episodeTagFollowsTitle ? 1 : 0;
+                    const bTagFollowsTitle = b.episodeTagFollowsTitle ? 1 : 0;
+                    
+                    if (aTagFollowsTitle !== bTagFollowsTitle) {
+                        return bTagFollowsTitle - aTagFollowsTitle;
+                    }
+                }
+                
+                // Dubbing preference comparison - explicit conversion to numbers
+                const dabA = Number(isPreferredDabing(a.name) || 0);
+                const dabB = Number(isPreferredDabing(b.name) || 0);
+                
+                if (dabA !== dabB) {
+                    return dabB - dabA;
+                }
+                
+                // Match score comparison - explicit numeric conversion
+                const matchA = Number(a.match || 0);
+                const matchB = Number(b.match || 0);
+                
+                if (matchA !== matchB) {
+                    return matchB - matchA;
+                }
+                
+                // Size comparison - explicit numeric conversion
+                const sizeA = Number(a.size || 0);
+                const sizeB = Number(b.size || 0);
+                
+                return sizeB - sizeA;
+            } catch (err) {
+                // Add minimal error handling to prevent crashes
+                console.error('Error in sorting:', err.message);
+                return 0; // Return equal if comparison fails
             }
-            
-            // Next check for dubbing preferences
-            const dabA = isPreferredDabing(a.name)
-            const dabB = isPreferredDabing(b.name)
-
-            if (dabA !== dabB) return dabB - dabA
-
-            // Next priority: match score
-            if (a.match !== b.match) return b.match - a.match
-
-            // If match scores are equal, sort by size (bigger first)
-            return b.size - a.size
         })
 
         // Filter results more intelligently
@@ -758,20 +732,24 @@ const webshare = {
             });
             
             // Log rejected items to understand filtering
-            console.log(`==== REJECTED ${rejectedItems.length} ITEMS ====`);
-            const topRejected = rejectedItems
-                .sort((a, b) => b.score - a.score)
-                .slice(0, 10); // Show top 10 rejected items by score
+            if (process.env.WEBSHARE_DEBUG) {
+                console.log(`==== REJECTED ${rejectedItems.length} ITEMS ====`);
+                const topRejected = rejectedItems
+                    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
+                    .slice(0, 10); // Show top 10 rejected items by score
+                    
+                topRejected.forEach(item => {
+                    console.log(`🚫 ${item.name} | Score: ${item.score.toFixed(2)} | ${item.reason}`);
+                });
                 
-            topRejected.forEach(item => {
-                console.log(`🚫 ${item.name} | Score: ${item.score.toFixed(2)} | ${item.reason}`);
-            });
-            
-            console.log(`Filtered from ${uniqueResults.length} to ${filteredResults.length} results using improved movie filtering`);
-            
+                console.log(`Filtered from ${uniqueResults.length} to ${filteredResults.length} results using improved movie filtering`);
+            }
+
             // If we've filtered too aggressively, use a more relaxed approach
             if (filteredResults.length < 10 && uniqueResults.length > 20) {
-                console.log("⚠️ Few results after filtering. Applying relaxed filtering...");
+                if (process.env.WEBSHARE_DEBUG) {
+                    console.log("⚠️ Few results after filtering. Applying relaxed filtering...");
+                }
                 
                 // For movies, use a smart fallback approach that mirrors the old addon
                 // but still tries to exclude obvious non-matches
@@ -1005,7 +983,7 @@ const webshare = {
         })).slice(0, limit);
         
         // Debug the final output sent to Stremio
-        console.log(`Sending ${finalResults.length} results to Stremio (${showInfo.clientInfo} client)`);
+        console.log(`Sending ${finalResults.length} results to Stremio`);
         console.log("First 3 results descriptions:", finalResults.slice(0, 3).map(r => r.description).join(", "));
         
         return finalResults;
@@ -1015,16 +993,12 @@ const webshare = {
         return Promise.all(streams.map(async stream => {
             const { ident, ...restStream } = stream
             const data = formencode({ ident, download_type: 'video_stream', force_https: 1, wst: token })
-            const resp = await needle('post', 'https://webshare.cz/api/file_link/', data, { 
-                headers,
-                timeout: 10000
-            })
+            const resp = await needle('post', 'https://webshare.cz/api/file_link/', data, { headers })
             const status = resp.body.children.find(el => el.name === 'status').value
             if (status === 'OK') {
                 const url = resp.body.children.find(el => el.name === 'link').value
                 return { ...restStream, url }
             } else {
-                console.error(`Failed to get stream URL for ${ident}: ${status}`);
                 return restStream
             }
         }))
