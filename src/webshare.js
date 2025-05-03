@@ -555,93 +555,54 @@ const webshare = {
             })
         }
 
-        // Make sorting more deterministic - simpler comparisons are more reliable across platforms
         uniqueResults.sort((a, b) => {
-            try {
-                // For series, create a simple numerical priority score for sorting
-                // This approach is more reliable across different JavaScript engines
-                if (showInfo.type === 'series') {
-                    // Convert boolean properties to explicit numbers for consistency
-                    const aTagFollowsTitle = a.episodeTagFollowsTitle ? 1 : 0;
-                    const bTagFollowsTitle = b.episodeTagFollowsTitle ? 1 : 0;
-                    
-                    // If one has tag following title and the other doesn't, prioritize that
-                    if (aTagFollowsTitle !== bTagFollowsTitle) {
-                        return bTagFollowsTitle - aTagFollowsTitle;
-                    }
-                    
-                    // Convert title at start to explicit numbers
-                    const aTitleStart = a.titleAtStart ? 1 : 0;
-                    const bTitleStart = b.titleAtStart ? 1 : 0;
-                    
-                    // If one has title at start and the other doesn't, prioritize that
-                    if (aTitleStart !== bTitleStart) {
-                        return bTitleStart - aTitleStart;
-                    }
-                    
-                    // Use explicit number conversion for series relevance comparison
-                    const aRelevance = Number(a.seriesRelevance || 0);
-                    const bRelevance = Number(b.seriesRelevance || 0);
-                    
-                    if (aRelevance !== bRelevance) {
-                        return bRelevance - aRelevance;
-                    }
+            // For series, prioritize based on our detailed scoring
+            if (showInfo.type === 'series') {
+                // First prioritize exact pattern: title directly followed by episode tag
+                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
+                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
+                
+                // Then prioritize title at beginning
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
+                
+                // Then by series relevance score
+                if (a.seriesRelevance !== b.seriesRelevance) {
+                    return b.seriesRelevance - a.seriesRelevance;
                 }
-                
-                // For movies, same approach - convert to explicit numbers
-                if (showInfo.type === 'movie') {
-                    const aTitleStart = a.titleAtStart ? 1 : 0;
-                    const bTitleStart = b.titleAtStart ? 1 : 0;
-                    
-                    if (aTitleStart !== bTitleStart) {
-                        return bTitleStart - aTitleStart;
-                    }
-                }
-                
-                // Series title at beginning check - again using explicit numbers
-                if (showInfo.type === 'series') {
-                    const aTitleStart = a.titleAtStart ? 1 : 0;
-                    const bTitleStart = b.titleAtStart ? 1 : 0;
-                    
-                    if (aTitleStart !== bTitleStart) {
-                        return bTitleStart - aTitleStart;
-                    }
-                    
-                    // Episode tag follows title check
-                    const aTagFollowsTitle = a.episodeTagFollowsTitle ? 1 : 0;
-                    const bTagFollowsTitle = b.episodeTagFollowsTitle ? 1 : 0;
-                    
-                    if (aTagFollowsTitle !== bTagFollowsTitle) {
-                        return bTagFollowsTitle - aTagFollowsTitle;
-                    }
-                }
-                
-                // Dubbing preference comparison - explicit conversion to numbers
-                const dabA = Number(isPreferredDabing(a.name) || 0);
-                const dabB = Number(isPreferredDabing(b.name) || 0);
-                
-                if (dabA !== dabB) {
-                    return dabB - dabA;
-                }
-                
-                // Match score comparison - explicit numeric conversion
-                const matchA = Number(a.match || 0);
-                const matchB = Number(b.match || 0);
-                
-                if (matchA !== matchB) {
-                    return matchB - matchA;
-                }
-                
-                // Size comparison - explicit numeric conversion
-                const sizeA = Number(a.size || 0);
-                const sizeB = Number(b.size || 0);
-                
-                return sizeB - sizeA;
-            } catch (err) {
-                // Add minimal error handling to prevent crashes
-                console.error('Error in sorting:', err.message);
-                return 0; // Return equal if comparison fails
             }
+            
+            // For movies, also consider title position
+            if (showInfo.type === 'movie') {
+                // Prioritize title at start for movies too
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
+                
+                // ...existing movie sorting criteria...
+            }
+            
+            // For series, more strongly penalize results where the title is not at the beginning
+            if (showInfo.type === 'series') {
+                // If one has title at beginning and one doesn't, this is the most important factor
+                if (a.titleAtStart && !b.titleAtStart) return -1;
+                if (!a.titleAtStart && b.titleAtStart) return 1;
+                
+                // If both have title at beginning or not, then check episode tag follows title
+                if (a.episodeTagFollowsTitle && !b.episodeTagFollowsTitle) return -1;
+                if (!a.episodeTagFollowsTitle && b.episodeTagFollowsTitle) return 1;
+            }
+            
+            // Next check for dubbing preferences
+            const dabA = isPreferredDabing(a.name)
+            const dabB = isPreferredDabing(b.name)
+
+            if (dabA !== dabB) return dabB - dabA
+
+            // Next priority: match score
+            if (a.match !== b.match) return b.match - a.match
+
+            // If match scores are equal, sort by size (bigger first)
+            return b.size - a.size
         })
 
         // Filter results more intelligently
@@ -732,24 +693,20 @@ const webshare = {
             });
             
             // Log rejected items to understand filtering
-            if (process.env.WEBSHARE_DEBUG) {
-                console.log(`==== REJECTED ${rejectedItems.length} ITEMS ====`);
-                const topRejected = rejectedItems
-                    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
-                    .slice(0, 10); // Show top 10 rejected items by score
-                    
-                topRejected.forEach(item => {
-                    console.log(`🚫 ${item.name} | Score: ${item.score.toFixed(2)} | ${item.reason}`);
-                });
+            console.log(`==== REJECTED ${rejectedItems.length} ITEMS ====`);
+            const topRejected = rejectedItems
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 10); // Show top 10 rejected items by score
                 
-                console.log(`Filtered from ${uniqueResults.length} to ${filteredResults.length} results using improved movie filtering`);
-            }
-
+            topRejected.forEach(item => {
+                console.log(`🚫 ${item.name} | Score: ${item.score.toFixed(2)} | ${item.reason}`);
+            });
+            
+            console.log(`Filtered from ${uniqueResults.length} to ${filteredResults.length} results using improved movie filtering`);
+            
             // If we've filtered too aggressively, use a more relaxed approach
             if (filteredResults.length < 10 && uniqueResults.length > 20) {
-                if (process.env.WEBSHARE_DEBUG) {
-                    console.log("⚠️ Few results after filtering. Applying relaxed filtering...");
-                }
+                console.log("⚠️ Few results after filtering. Applying relaxed filtering...");
                 
                 // For movies, use a smart fallback approach that mirrors the old addon
                 // but still tries to exclude obvious non-matches
