@@ -5,9 +5,11 @@ const formencode = require('form-urlencoded')
 const { filesize } = require('filesize')
 require('dotenv').config()
 
+// Updated headers with consistent user-agent to ensure platform-independent results
 const headers = {
     content_type: 'application/x-www-form-urlencoded; charset=UTF-8',
-    accept: 'text/xml; charset=UTF-8'
+    accept: 'text/xml; charset=UTF-8',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
 
 const clean = str => str
@@ -128,8 +130,23 @@ const getQueries = (info) => {
 }
 
 const search = async (query, token, info) => {
+    // Log search query to help debug differences between platforms
+    console.log(`🔍 Searching for: "${query}" - Type: ${info.type} - Client: ${info.clientInfo || 'unknown'}`);
+    
     const data = formencode({ what: query, category: 'video', limit: 100, wst: token })
-    const resp = await needle('post', 'https://webshare.cz/api/search/', data, { headers })
+    const resp = await needle('post', 'https://webshare.cz/api/search/', data, { 
+        headers,
+        // Add more consistent behavior for network timeouts across platforms
+        follow_max: 5,
+        follow_set_cookie: true,
+        decode_response: true,
+        parse_response: true,
+        timeout: 10000 // 10 second timeout for all requests
+    })
+    
+    // Log API response status to debug any differences
+    console.log(`API response status: ${resp.statusCode} - Results: ${resp.body?.children?.filter(el => el.name === 'file').length || 0}`);
+    
     const files = resp.body.children.filter(el => el.name === 'file')
 
     const queryClean = clean(query)
@@ -414,23 +431,71 @@ const webshare = {
     login: async () => {
         const user = process.env.WEBSHARE_LOGIN
         const password = process.env.WEBSHARE_PASSWORD
-        const saltResp = await needle('post', 'https://webshare.cz/api/salt/', `username_or_email=${user}`, { headers })
+        
+        console.log('🔑 Attempting login to Webshare.cz');
+        
+        const saltResp = await needle('post', 'https://webshare.cz/api/salt/', `username_or_email=${user}`, { 
+            headers,
+            timeout: 10000
+        })
         const salt = saltResp.body.children.find(el => el.name === 'salt').value
 
         const passEncoded = sha1(md5.crypt(password, salt))
         const data = formencode({ username_or_email: user, password: passEncoded, keep_logged_in: 0 })
-        const resp = await needle('post', 'https://webshare.cz/api/login/', data, { headers })
+        const resp = await needle('post', 'https://webshare.cz/api/login/', data, { 
+            headers,
+            timeout: 10000 
+        })
         if (resp.statusCode !== 200 || resp.body.children.find(el => el.name === 'status').value !== 'OK') {
             throw Error('Cannot log in to Webshare.cz, invalid login credentials')
         }
+        
+        console.log('✅ Successfully logged in to Webshare.cz');
+        
         return resp.body.children.find(el => el.name === 'token').value
     },
 
     search: async (showInfo, token) => {
+        // Store client information if provided to help debug platform differences
+        if (showInfo.clientInfo === undefined) {
+            // Extract client info from request headers if available
+            showInfo.clientInfo = 'unknown';
+            try {
+                if (global.stremioReq && global.stremioReq.headers) {
+                    const ua = global.stremioReq.headers['user-agent'] || '';
+                    if (ua.includes('Android') || ua.includes('TV')) {
+                        showInfo.clientInfo = 'android-tv';
+                    } else if (ua.includes('Mobile')) {
+                        showInfo.clientInfo = 'mobile';
+                    } else {
+                        showInfo.clientInfo = 'desktop';
+                    }
+                }
+            } catch (e) {
+                console.error('Error extracting client info:', e.message);
+            }
+        }
+        
+        console.log(`🎬 Searching for ${showInfo.type}: "${showInfo.name}" - Client: ${showInfo.clientInfo}`);
+        
         const queries = getQueries(showInfo)
-        let results = await Promise.all(queries.map(query => search(query, token, showInfo)))
-        results = results.flatMap(items => items)
-
+        console.log(`Generated ${queries.length} search queries`);
+        
+        // Ensure consistent behavior by limiting parallel requests which might cause rate limiting on different platforms
+        const chunkSize = 5; // Process 5 queries at a time to avoid overwhelming the API
+        let results = [];
+        
+        // Process queries in chunks to avoid rate limiting
+        for (let i = 0; i < queries.length; i += chunkSize) {
+            const chunk = queries.slice(i, i + chunkSize);
+            const chunkResults = await Promise.all(chunk.map(query => search(query, token, showInfo)));
+            results = [...results, ...chunkResults.flat()];
+            // Small delay between chunks to avoid API rate limits that might affect different platforms differently
+            if (i + chunkSize < queries.length) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+        }
+        
         const isPreferredDabing = (name) => {
             // Enhanced pattern matching for different audio localizations
             const dabingPatterns = [
@@ -940,7 +1005,7 @@ const webshare = {
         })).slice(0, limit);
         
         // Debug the final output sent to Stremio
-        console.log(`Sending ${finalResults.length} results to Stremio`);
+        console.log(`Sending ${finalResults.length} results to Stremio (${showInfo.clientInfo} client)`);
         console.log("First 3 results descriptions:", finalResults.slice(0, 3).map(r => r.description).join(", "));
         
         return finalResults;
@@ -950,12 +1015,16 @@ const webshare = {
         return Promise.all(streams.map(async stream => {
             const { ident, ...restStream } = stream
             const data = formencode({ ident, download_type: 'video_stream', force_https: 1, wst: token })
-            const resp = await needle('post', 'https://webshare.cz/api/file_link/', data, { headers })
+            const resp = await needle('post', 'https://webshare.cz/api/file_link/', data, { 
+                headers,
+                timeout: 10000
+            })
             const status = resp.body.children.find(el => el.name === 'status').value
             if (status === 'OK') {
                 const url = resp.body.children.find(el => el.name === 'link').value
                 return { ...restStream, url }
             } else {
+                console.error(`Failed to get stream URL for ${ident}: ${status}`);
                 return restStream
             }
         }))
