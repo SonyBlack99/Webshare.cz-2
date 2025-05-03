@@ -692,22 +692,8 @@ const webshare = {
                 return false;
             });
             
-            // Log rejected items to understand filtering
-            console.log(`==== REJECTED ${rejectedItems.length} ITEMS ====`);
-            const topRejected = rejectedItems
-                .sort((a, b) => b.score - a.score)
-                .slice(0, 10); // Show top 10 rejected items by score
-                
-            topRejected.forEach(item => {
-                console.log(`🚫 ${item.name} | Score: ${item.score.toFixed(2)} | ${item.reason}`);
-            });
-            
-            console.log(`Filtered from ${uniqueResults.length} to ${filteredResults.length} results using improved movie filtering`);
-            
             // If we've filtered too aggressively, use a more relaxed approach
             if (filteredResults.length < 10 && uniqueResults.length > 20) {
-                console.log("⚠️ Few results after filtering. Applying relaxed filtering...");
-                
                 // For movies, use a smart fallback approach that mirrors the old addon
                 // but still tries to exclude obvious non-matches
                 const relaxedResults = uniqueResults.filter(item => {
@@ -734,12 +720,9 @@ const webshare = {
                     return item.match >= 0.3;
                 });
                 
-                console.log(`Relaxed filtering: found ${relaxedResults.length} results`);
-                
                 // Use relaxed results but ensure a reasonable limit
                 const maxResults = Math.min(40, relaxedResults.length);
                 if (relaxedResults.length > filteredResults.length) {
-                    console.log(`📊 Using relaxed filtering to show ${maxResults} results`);
                     filteredResults = relaxedResults.slice(0, maxResults);
                 }
             }
@@ -938,10 +921,6 @@ const webshare = {
             description: item.name,
             name: `💾 ${filesize(item.size)} 👍 ${item.posVotes} 👎 ${item.negVotes}`
         })).slice(0, limit);
-        
-        // Debug the final output sent to Stremio
-        console.log(`Sending ${finalResults.length} results to Stremio`);
-        console.log("First 3 results descriptions:", finalResults.slice(0, 3).map(r => r.description).join(", "));
         
         return finalResults;
     },
