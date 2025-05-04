@@ -3,7 +3,9 @@
 	"version": "0.2.0",
 	"description": "Simple webshare.cz search and streaming.",
 	"scripts": {
-		"start": "node src/server.js"
+		"start": "node src/index.js",
+		"dev": "nodemon src/index.js",
+		"build": "echo 'Build step completed'"
 	},
 	"dependencies": {
 		"dotenv": "^16.5.0",
@@ -11,6 +13,7 @@
 		"form-urlencoded": "^6.1.4",
 		"nano-md5": "^1.0.5",
 		"needle": "^3.3.1",
+		"p-limit": "^6.2.0",
 		"sha1": "^1.1.1",
 		"stremio-addon-sdk": "1.6.x"
 	}

@@ -13,7 +13,7 @@ const manifest = {
 		"movie",
 		"series"
 	],
-	"name": "Webshare.cz 2",
+	"name": "Webshare.cz TEST",
 	"description": "Upravený webshare.cz pre lepšie vyhľadávanie.",
 	"idPrefixes": [
 		"tt"
